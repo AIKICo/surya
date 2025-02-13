@@ -1,10 +1,10 @@
-from typing import Dict, Optional
+import os
+from typing import Callable, Dict, Optional
 
+import torch
 from dotenv import find_dotenv
 from pydantic import computed_field
 from pydantic_settings import BaseSettings
-import torch
-import os
 
 
 class Settings(BaseSettings):
@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     ENABLE_EFFICIENT_ATTENTION: bool = True # Usually keep True, but if you get CUDA errors, setting to False can help
     ENABLE_CUDNN_ATTENTION: bool = False # Causes issues on many systems when set to True, but can improve performance on certain GPUs
     FLATTEN_PDF: bool = True # Flatten PDFs by merging form fields before processing
+    DISABLE_TQDM: bool = False # Disable tqdm progress bars
 
     # Paths
     DATA_DIR: str = "data"
@@ -34,11 +35,18 @@ class Settings(BaseSettings):
         if torch.backends.mps.is_available():
             return "mps"
 
+        try:
+            import torch_xla
+            if len(torch_xla.devices()) > 0:
+                return "xla"
+        except:
+            pass
+
         return "cpu"
 
     # Text detection
     DETECTOR_BATCH_SIZE: Optional[int] = None # Defaults to 2 for CPU/MPS, 32 otherwise
-    DETECTOR_MODEL_CHECKPOINT: str = "vikp/surya_det3"
+    DETECTOR_MODEL_CHECKPOINT: str = "vikp/surya_det3@467ee9ec33e6e6c5f73e57dbc1415b14032f5b95"
     DETECTOR_BENCH_DATASET_NAME: str = "vikp/doclaynet_bench"
     DETECTOR_IMAGE_CHUNK_HEIGHT: int = 1400 # Height at which to slice images vertically
     DETECTOR_TEXT_THRESHOLD: float = 0.6 # Threshold for text detection (above this is considered text)
@@ -47,8 +55,16 @@ class Settings(BaseSettings):
     DETECTOR_MIN_PARALLEL_THRESH: int = 3 # Minimum number of images before we parallelize
     COMPILE_DETECTOR: bool = False
 
+    # Inline math detection
+    INLINE_MATH_MODEL_CHECKPOINT: str = "datalab-to/inline_math_det0@75aafc7aa3d494ece6496d28038c91f0d2518a43"
+    INLINE_MATH_THRESHOLD: float = 0.8 #Threshold for inline math detection (above this is considered inline-math)
+    INLINE_MATH_BLANK_THRESHOLD: float = 0.5 # Threshold for blank space (below this is considered blank)
+    INLINE_MATH_BENCH_DATASET_NAME: str = "datalab-to/inline_detection_bench"
+    INLINE_MATH_TEXT_BLANK_PX: int = 2 # How many pixels to blank out at the botton of each text line
+    INLINE_MATH_MIN_AREA: int = 100 # Minimum area for inline math detection
+
     # Text recognition
-    RECOGNITION_MODEL_CHECKPOINT: str = "vikp/surya_rec2"
+    RECOGNITION_MODEL_CHECKPOINT: str = "vikp/surya_rec2@6611509b2c3a32c141703ce19adc899d9d0abf41"
     RECOGNITION_MAX_TOKENS: int = 175
     RECOGNITION_BATCH_SIZE: Optional[int] = None # Defaults to 8 for CPU/MPS, 256 otherwise
     RECOGNITION_IMAGE_SIZE: Dict = {"height": 256, "width": 896}
@@ -62,10 +78,9 @@ class Settings(BaseSettings):
     RECOGNITION_BENCH_DATASET_NAME: str = "vikp/rec_bench"
     RECOGNITION_PAD_VALUE: int = 255 # Should be 0 or 255
     COMPILE_RECOGNITION: bool = False # Static cache for torch compile
-    RECOGNITION_ENCODER_BATCH_DIVISOR: int = 1 # Divisor for batch size in decoder
 
     # Layout
-    LAYOUT_MODEL_CHECKPOINT: str = "datalab-to/surya_layout"
+    LAYOUT_MODEL_CHECKPOINT: str = "datalab-to/surya_layout@7ac8e390226ee5fa2125dd303d827f79d31d1a1f"
     LAYOUT_IMAGE_SIZE: Dict = {"height": 768, "width": 768}
     LAYOUT_SLICE_MIN: Dict = {"height": 1500, "width": 1500} # When to start slicing images
     LAYOUT_SLICE_SIZE: Dict = {"height": 1200, "width": 1200} # Size of slices
@@ -76,16 +91,23 @@ class Settings(BaseSettings):
     ORDER_BENCH_DATASET_NAME: str = "vikp/order_bench"
 
     # Table Rec
-    TABLE_REC_MODEL_CHECKPOINT: str = "vikp/surya_tablerec"
-    TABLE_REC_IMAGE_SIZE: Dict = {"height": 640, "width": 640}
-    TABLE_REC_MAX_BOXES: int = 512
-    TABLE_REC_MAX_ROWS: int = 384
+    TABLE_REC_MODEL_CHECKPOINT: str = "datalab-to/surya_tablerec@7327dac38c300b2f6cd0501ebc2347dd3ef7fcf2"
+    TABLE_REC_IMAGE_SIZE: Dict = {"height": 768, "width": 768}
+    TABLE_REC_MAX_BOXES: int = 150
     TABLE_REC_BATCH_SIZE: Optional[int] = None
-    TABLE_REC_BENCH_DATASET_NAME: str = "vikp/fintabnet_bench"
+    TABLE_REC_BENCH_DATASET_NAME: str = "datalab-to/fintabnet_bench"
     COMPILE_TABLE_REC: bool = False
 
+    # Texify
+    TEXIFY_MODEL_CHECKPOINT: str = "datalab-to/texify@8f1d761762b3e977e9e62cebfca487d489556abc"
+    TEXIFY_BENCHMARK_DATASET: str = "datalab-to/texify_bench"
+    TEXIFY_IMAGE_SIZE: Dict = {"height": 480, "width": 480}
+    TEXIFY_MAX_TOKENS: int = 768
+    TEXIFY_BATCH_SIZE: Optional[int] = None
+    COMPILE_TEXIFY: bool = False
+
     # OCR Error Detection
-    OCR_ERROR_MODEL_CHECKPOINT: str = "datalab-to/ocr_error_detection"
+    OCR_ERROR_MODEL_CHECKPOINT: str = "datalab-to/ocr_error_detection@c1cbda3757670fd520553eaa5197656d331de414"
     OCR_ERROR_BATCH_SIZE: Optional[int] = None
     COMPILE_OCR_ERROR: bool = False
 
@@ -96,28 +118,41 @@ class Settings(BaseSettings):
 
     @computed_field
     def DETECTOR_STATIC_CACHE(self) -> bool:
-        return self.COMPILE_ALL or self.COMPILE_DETECTOR
+        return self.COMPILE_ALL or self.COMPILE_DETECTOR or self.TORCH_DEVICE_MODEL == "xla" # We need to static cache and pad to batch size for XLA, since it will recompile otherwise
 
     @computed_field
     def RECOGNITION_STATIC_CACHE(self) -> bool:
-        return self.COMPILE_ALL or self.COMPILE_RECOGNITION
+        return self.COMPILE_ALL or self.COMPILE_RECOGNITION or self.TORCH_DEVICE_MODEL == "xla"
 
     @computed_field
     def LAYOUT_STATIC_CACHE(self) -> bool:
-        return self.COMPILE_ALL or self.COMPILE_LAYOUT
+        return self.COMPILE_ALL or self.COMPILE_LAYOUT or self.TORCH_DEVICE_MODEL == "xla"
 
     @computed_field
     def TABLE_REC_STATIC_CACHE(self) -> bool:
-        return self.COMPILE_ALL or self.COMPILE_TABLE_REC
+        return self.COMPILE_ALL or self.COMPILE_TABLE_REC or self.TORCH_DEVICE_MODEL == "xla"
 
     @computed_field
     def OCR_ERROR_STATIC_CACHE(self) -> bool:
-        return self.COMPILE_ALL or self.COMPILE_OCR_ERROR
+        return self.COMPILE_ALL or self.COMPILE_OCR_ERROR or self.TORCH_DEVICE_MODEL == "xla"
 
     @computed_field
-    @property
+    def TEXIFY_STATIC_CACHE(self) -> bool:
+        return self.COMPILE_ALL or self.COMPILE_TEXIFY or self.TORCH_DEVICE_MODEL == "xla"
+
+    @computed_field
     def MODEL_DTYPE(self) -> torch.dtype:
-        return torch.float32 if self.TORCH_DEVICE_MODEL == "cpu" else torch.float16
+        if self.TORCH_DEVICE_MODEL == "cpu":
+            return torch.float32
+        if self.TORCH_DEVICE_MODEL == "xla":
+            return torch.bfloat16
+        return torch.float16
+
+    @computed_field
+    def INFERENCE_MODE(self) -> Callable:
+        if self.TORCH_DEVICE_MODEL == "xla":
+            return torch.no_grad
+        return torch.inference_mode
 
     class Config:
         env_file = find_dotenv("local.env")
