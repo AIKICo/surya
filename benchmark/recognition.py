@@ -1,15 +1,16 @@
 import argparse
 from collections import defaultdict
 
-from benchmark.scoring import overlap_score
+import click
+
+from benchmark.utils.scoring import overlap_score
 from surya.input.processing import convert_if_not_rgb
-from surya.model.recognition.model import load_model as load_recognition_model
-from surya.model.recognition.processor import load_processor as load_recognition_processor
-from surya.ocr import run_recognition
-from surya.postprocessing.text import draw_text_on_image
+from surya.debug.text import draw_text_on_image
+from surya.recognition import RecognitionPredictor
 from surya.settings import settings
-from surya.languages import CODE_TO_LANGUAGE
-from surya.benchmark.tesseract import tesseract_ocr_parallel, surya_lang_to_tesseract, TESS_CODE_TO_LANGUAGE
+from surya.recognition.languages import CODE_TO_LANGUAGE
+from benchmark.utils.tesseract import tesseract_ocr_parallel, surya_lang_to_tesseract, TESS_CODE_TO_LANGUAGE
+from benchmark.utils.textract import textract_ocr_parallel
 import os
 import datasets
 import json
@@ -18,30 +19,28 @@ from tabulate import tabulate
 
 KEY_LANGUAGES = ["Chinese", "Spanish", "English", "Arabic", "Hindi", "Bengali", "Russian", "Japanese"]
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Detect bboxes in a PDF.")
-    parser.add_argument("--results_dir", type=str, help="Path to JSON file with OCR results.", default=os.path.join(settings.RESULT_DIR, "benchmark"))
-    parser.add_argument("--max", type=int, help="Maximum number of pdf pages to OCR.", default=None)
-    parser.add_argument("--debug", type=int, help="Debug level - 1 dumps bad detection info, 2 writes out images.", default=0)
-    parser.add_argument("--tesseract", action="store_true", help="Run tesseract instead of surya.", default=False)
-    parser.add_argument("--langs", type=str, help="Specify certain languages to benchmark.", default=None)
-    parser.add_argument("--tess_cpus", type=int, help="Number of CPUs to use for tesseract.", default=28)
-    parser.add_argument("--specify_language", action="store_true", help="Pass language codes into the model.", default=False)
-    args = parser.parse_args()
-
-    rec_model = load_recognition_model()
-    rec_processor = load_recognition_processor()
+@click.command(help="Benchmark recognition model.")
+@click.option("--results_dir", type=str, help="Path to JSON file with OCR results.", default=os.path.join(settings.RESULT_DIR, "benchmark"))
+@click.option("--max_rows", type=int, help="Maximum number of pdf pages to OCR.", default=None)
+@click.option("--debug", is_flag=True, help="Enable debug mode.", default=False)
+@click.option("--tesseract", is_flag=True, help="Run benchmarks on tesseract.", default=False)
+@click.option("--textract", is_flag=True, help="Run benchmarks on textract.", default=False)
+@click.option("--langs", type=str, help="Specify certain languages to benchmark.", default=None)
+@click.option("--tess_cpus", type=int, help="Number of CPUs to use for tesseract.", default=28)
+@click.option("--textract_cpus", type=int, help="Number of CPUs to use for textract.", default=28)
+@click.option("--specify_language", is_flag=True, help="Pass language codes into the model.", default=False)
+def main(results_dir: str, max_rows: int, debug: bool, tesseract: bool, textract: bool, langs: str, tess_cpus: int, textract_cpus:int, specify_language: bool):
+    rec_predictor = RecognitionPredictor()
 
     split = "train"
-    if args.max:
-        split = f"train[:{args.max}]"
-
     dataset = datasets.load_dataset(settings.RECOGNITION_BENCH_DATASET_NAME, split=split)
 
-    if args.langs:
-        langs = args.langs.split(",")
+    if langs:
+        langs = langs.split(",")
         dataset = dataset.filter(lambda x: x["language"] in langs, num_proc=4)
+    
+    if max_rows and max_rows<len(dataset):
+        dataset = dataset.shuffle().select(range(max_rows))
 
     images = list(dataset["image"])
     images = convert_if_not_rgb(images)
@@ -61,10 +60,10 @@ def main():
 
     if settings.RECOGNITION_STATIC_CACHE:
         # Run through one batch to compile the model
-        run_recognition(images[:1], lang_list[:1], rec_model, rec_processor, bboxes=bboxes[:1])
+        rec_predictor(images[:1], lang_list[:1], bboxes=bboxes[:1])
 
     start = time.time()
-    predictions_by_image = run_recognition(images, lang_list if args.specify_language else n_list, rec_model, rec_processor, bboxes=bboxes)
+    predictions_by_image = rec_predictor(images, lang_list if specify_language else n_list, bboxes=bboxes)
     surya_time = time.time() - start
 
     surya_scores = defaultdict(list)
@@ -85,13 +84,13 @@ def main():
         }
     }
 
-    result_path = os.path.join(args.results_dir, "rec_bench")
+    result_path = os.path.join(results_dir, "rec_bench")
     os.makedirs(result_path, exist_ok=True)
 
     with open(os.path.join(result_path, "surya_scores.json"), "w+") as f:
         json.dump(surya_scores, f)
 
-    if args.tesseract:
+    if tesseract:
         tess_valid = []
         tess_langs = []
         for idx, lang in enumerate(lang_list):
@@ -107,7 +106,7 @@ def main():
         tess_bboxes = [bboxes[i] for i in tess_valid]
         tess_reference = [line_text[i] for i in tess_valid]
         start = time.time()
-        tess_predictions = tesseract_ocr_parallel(tess_imgs, tess_bboxes, tess_langs, cpus=args.tess_cpus)
+        tess_predictions = tesseract_ocr_parallel(tess_imgs, tess_bboxes, tess_langs, cpus=tess_cpus)
         tesseract_time = time.time() - start
 
         tess_scores = defaultdict(list)
@@ -125,7 +124,29 @@ def main():
         with open(os.path.join(result_path, "tesseract_scores.json"), "w+") as f:
             json.dump(tess_scores, f)
 
-    with open(os.path.join(result_path, "results.json"), "w+") as f:
+    if textract:
+        start = time.time()
+        textract_predictions = textract_ocr_parallel(images, cpus=textract_cpus)
+        textract_time = time.time()-start
+
+        textract_scores = defaultdict(list)
+        for idx, (pred, ref_text, lang) in enumerate(zip(textract_predictions, line_text, lang_list)):
+            image_score = overlap_score(pred, ref_text)
+            for l in lang:
+                textract_scores[CODE_TO_LANGUAGE[l]].append(image_score)
+
+        flat_textract_scores = [s for l in textract_scores for s in textract_scores[l]]
+        benchmark_stats["textract"] = {
+            "avg_score": sum(flat_textract_scores) / len(flat_textract_scores),
+            "lang_scores": {l: sum(scores) / len(scores) for l, scores in textract_scores.items()},
+            "time_per_img": textract_time / len(images)
+        }
+        print(len(flat_textract_scores))
+
+        with open(os.path.join(result_path, "textract_scores.json"), "w+") as f:
+            json.dump(textract_scores, f)
+
+    with open(os.path.join(result_path, "results.json"), "w+", encoding="utf-8") as f:
         json.dump(benchmark_stats, f)
 
     key_languages = [k for k in KEY_LANGUAGES if k in surya_scores]
@@ -133,15 +154,19 @@ def main():
     table_data = [
         ["surya", benchmark_stats["surya"]["time_per_img"], benchmark_stats["surya"]["avg_score"]] + [benchmark_stats["surya"]["lang_scores"][l] for l in key_languages],
     ]
-    if args.tesseract:
+    if tesseract:
         table_data.append(
             ["tesseract", benchmark_stats["tesseract"]["time_per_img"], benchmark_stats["tesseract"]["avg_score"]] + [benchmark_stats["tesseract"]["lang_scores"].get(l, 0) for l in key_languages]
+        )
+    if textract:
+        table_data.append(
+            ["textract", benchmark_stats["textract"]["time_per_img"], benchmark_stats["textract"]["avg_score"]] + [benchmark_stats["textract"]["lang_scores"][l] for l in key_languages],
         )
 
     print(tabulate(table_data, headers=table_headers, tablefmt="github"))
     print("Only a few major languages are displayed. See the result path for additional languages.")
 
-    if args.debug >= 1:
+    if debug >= 1:
         bad_detections = []
         for idx, (score, lang) in enumerate(zip(flat_surya_scores, lang_list)):
             if score < .8:
@@ -150,7 +175,7 @@ def main():
         with open(os.path.join(result_path, "bad_detections.json"), "w+") as f:
             json.dump(bad_detections, f)
 
-    if args.debug == 2:
+    if debug == 2:
         for idx, (image, pred, ref_text, bbox, lang) in enumerate(zip(images, predictions_by_image, line_text, bboxes, lang_list)):
             pred_image_name = f"{'_'.join(lang)}_{idx}_pred.png"
             ref_image_name = f"{'_'.join(lang)}_{idx}_ref.png"
